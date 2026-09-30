@@ -54,6 +54,179 @@ export function normalizeForFuzzyMatch(text: string): string {
 	);
 }
 
+/** Tab widths a model may have used when it expanded a file's tabs to spaces. */
+const INDENT_TAB_WIDTHS = [4, 2, 8];
+
+/**
+ * Repair an edit whose `oldText` differs from `content` only by indentation
+ * style, for example because a model wrote spaces where the file uses tabs.
+ *
+ * Matching expands tabs to a fixed width on both sides and requires the block
+ * to be unique. Only tab-indented regions are repaired. The returned edit uses
+ * the exact on-disk text for `oldText` and re-indents `newText` to tabs.
+ */
+export function repairIndentationMismatch(content: string, oldText: string, newText: string): Edit | undefined {
+	if (oldText.length === 0) {
+		return undefined;
+	}
+	for (const width of INDENT_TAB_WIDTHS) {
+		// Try leading indentation first (the common case), then every tab so
+		// internal tab/space differences are covered too.
+		for (const leadingOnly of [true, false]) {
+			const repaired = tryRepairIndentation(content, oldText, newText, width, leadingOnly);
+			if (repaired) {
+				return repaired;
+			}
+		}
+	}
+	return undefined;
+}
+
+function tryRepairIndentation(
+	content: string,
+	oldText: string,
+	newText: string,
+	width: number,
+	leadingOnly: boolean,
+): Edit | undefined {
+	const { expanded, originalIndex } = expandTabsForMatching(content, width, leadingOnly);
+	const expandedOldText = leadingOnly
+		? expandLeadingTabsPerLine(oldText, width)
+		: oldText.replace(/\t/g, " ".repeat(width));
+	if (expandedOldText.length === 0) {
+		return undefined;
+	}
+
+	const first = expanded.indexOf(expandedOldText);
+	if (first === -1) {
+		return undefined;
+	}
+	if (expanded.indexOf(expandedOldText, first + 1) !== -1) {
+		// Ambiguous: leave the edit to the normal matcher.
+		return undefined;
+	}
+
+	let start = originalIndex[first];
+	const last = first + expandedOldText.length - 1;
+	let end = last < originalIndex.length ? originalIndex[last] + 1 : content.length;
+	if (end <= start) {
+		return undefined;
+	}
+
+	// If the match begins inside the line's leading whitespace, take the whole
+	// line so the replacement owns the full indentation.
+	const lineStart = content.lastIndexOf("\n", start - 1) + 1;
+	const leading = /^[ \t]*/.exec(content.slice(lineStart))?.[0] ?? "";
+	if (start <= lineStart + leading.length) {
+		start = lineStart;
+	}
+
+	const onDisk = content.slice(start, end);
+	if (!onDisk.includes("\t")) {
+		// Leave space-indented files to the normal matcher.
+		return undefined;
+	}
+
+	// The matching width can be ambiguous (two levels of two spaces also look
+	// like one level of four), so pick the width that reproduces the on-disk
+	// text from the model's oldText.
+	let reindentWidth = width;
+	for (const candidate of INDENT_TAB_WIDTHS) {
+		if (reindentLeadingSpacesToTabs(oldText, candidate) === onDisk) {
+			reindentWidth = candidate;
+			break;
+		}
+	}
+
+	const reindented = reindentLeadingSpacesToTabs(newText, reindentWidth);
+	if (onDisk === reindented) {
+		return undefined;
+	}
+	return { oldText: onDisk, newText: reindented };
+}
+
+/** Expand tabs and return the source index of every expanded character. */
+function expandTabsForMatching(
+	content: string,
+	width: number,
+	leadingOnly: boolean,
+): { expanded: string; originalIndex: number[] } {
+	const expanded: string[] = [];
+	const originalIndex: number[] = [];
+
+	if (!leadingOnly) {
+		for (let i = 0; i < content.length; i++) {
+			if (content[i] === "\t") {
+				for (let n = 0; n < width; n++) {
+					expanded.push(" ");
+					originalIndex.push(i);
+				}
+			} else {
+				expanded.push(content[i]);
+				originalIndex.push(i);
+			}
+		}
+		return { expanded: expanded.join(""), originalIndex };
+	}
+
+	let i = 0;
+	while (i < content.length) {
+		const atLineStart = i === 0 || content[i - 1] === "\n";
+		if (!atLineStart) {
+			expanded.push(content[i]);
+			originalIndex.push(i);
+			i++;
+			continue;
+		}
+		let lineEnd = i;
+		while (lineEnd < content.length && (content[lineEnd] === " " || content[lineEnd] === "\t")) {
+			lineEnd++;
+		}
+		const hasIndent = lineEnd > i;
+		for (let k = i; k < lineEnd; k++) {
+			if (content[k] === "\t") {
+				for (let n = 0; n < width; n++) {
+					expanded.push(" ");
+					originalIndex.push(k);
+				}
+			} else {
+				expanded.push(" ");
+				originalIndex.push(k);
+			}
+		}
+		i = lineEnd;
+		if (!hasIndent) {
+			expanded.push(content[i]);
+			originalIndex.push(i);
+			i++;
+		}
+	}
+	return { expanded: expanded.join(""), originalIndex };
+}
+
+function expandLeadingTabsPerLine(text: string, width: number): string {
+	return text
+		.split("\n")
+		.map((line) => {
+			const leading = /^[ \t]*/.exec(line)?.[0] ?? "";
+			return leading.replace(/\t/g, " ".repeat(width)) + line.slice(leading.length);
+		})
+		.join("\n");
+}
+
+function reindentLeadingSpacesToTabs(text: string, width: number): string {
+	return text
+		.split("\n")
+		.map((line) => {
+			const match = /^ */.exec(line);
+			const spaces = match ? match[0].length : 0;
+			const tabs = Math.floor(spaces / width);
+			const remainder = spaces % width;
+			return "\t".repeat(tabs) + " ".repeat(remainder) + line.slice(spaces);
+		})
+		.join("\n");
+}
+
 function splitLinesWithEndings(content: string): string[] {
 	return content.match(/[^\n]*\n|[^\n]+/g) ?? [];
 }
@@ -310,6 +483,20 @@ export function applyEditsToNormalizedContent(
 	for (let i = 0; i < normalizedEdits.length; i++) {
 		if (normalizedEdits[i].oldText.length === 0) {
 			throw getEmptyOldTextError(path, i, normalizedEdits.length);
+		}
+	}
+
+	// Repair edits that differ only by indentation style before matching. Only
+	// attempted when the normal matcher would fail, so existing fuzzy behavior
+	// is unchanged.
+	for (const edit of normalizedEdits) {
+		if (edit.oldText.length === 0 || fuzzyFindText(normalizedContent, edit.oldText).found) {
+			continue;
+		}
+		const repaired = repairIndentationMismatch(normalizedContent, edit.oldText, edit.newText);
+		if (repaired) {
+			edit.oldText = repaired.oldText;
+			edit.newText = repaired.newText;
 		}
 	}
 
